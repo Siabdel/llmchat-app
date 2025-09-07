@@ -104,6 +104,8 @@
 </template>
 
 <script>
+// ... (les imports et data existants restent inchangés)
+import axios from 'axios';
 import ChatSidebar from './components/ChatSidebar.vue'
 import ChatMessages from './components/ChatMessages.vue'
 import PromptEditor from './components/PromptEditor.vue'
@@ -181,14 +183,14 @@ export default {
   },
   created() {
     this.loadAppState()
-    window.addEventListener('beforeunload', this.handleBeforeUnload)
-  },
-  mounted() {
-    window.addEventListener('resize', this.handleResize)
+    window.addEventListener('beforeunload', this.handleBeforeUnload);
+    window.removeEventListener('resize', this.handleResize);
   },
   beforeUnmount() {
-    window.removeEventListener('beforeunload', this.handleBeforeUnload)
-    window.removeEventListener('resize', this.handleResize)
+    // Nettoie le controller si le composant est détruit
+    this.cancelStream();
+    window.removeEventListener('beforeunload', this.handleBeforeUnload);
+    window.removeEventListener('resize', this.handleResize);
   },
   methods: {
     toggleSidebar() {
@@ -210,7 +212,11 @@ export default {
         this.createNewChat()
       } else {
         const chatIds = Object.keys(this.chats)
-        this.loadChat(chatIds[chatIds.length - 1])
+        if (chatIds.length > 0) {
+          this.loadChat(chatIds[chatIds.length - 1])
+        } else {
+          this.createNewChat();
+        }
       }
     },
     loadAppState() {
@@ -243,86 +249,287 @@ export default {
       this.saveAppState()
     },
     loadChat(chatId) {
-      this.currentChatId = chatId
-      this.saveAppState()
+      if (this.chats[chatId]) {
+        this.currentChatId = chatId
+        this.saveAppState()
+      } else {
+        console.error(`Invalid chatId: ${chatId}`);
+        // Optionally, create a new chat here
+        this.createNewChat();
+      }
     },
     deleteCurrentChat() {
       if (!this.currentChatId || Object.keys(this.chats).length <= 1) {
         this.createNewChat()
-        return
+      } else {
+        delete this.chats[this.currentChatId]
+        const chatIds = Object.keys(this.chats)
+        if (chatIds.length > 0) {
+          this.loadChat(chatIds[0])
+        } else {
+          this.createNewChat();
+        }
+        this.saveAppState()
       }
-      delete this.chats[this.currentChatId]
-      const chatIds = Object.keys(this.chats)
-      this.loadChat(chatIds[0])
-      this.saveAppState()
     },
     handleFileUpload(files) {
       this.uploadedFiles = [...this.uploadedFiles, ...files]
     },
-    sendMessage() {
-      if (!this.promptText.trim()) return
+    
 
-      const userMessage = {
-        role: 'user',
-        content: this.promptText,
-        timestamp: new Date().toISOString()
+    
+   async sendMessage() {
+      // 1. Vérifications préliminaires
+      if (!this.promptText.trim()) {
+        console.warn("Message vide ignoré");
+        return;
+      }
+      if (!this.apiKey) {
+        this.handleApiError(new Error("Clé API manquante"));
+        return;
+      }
+      if (!this.currentChatId || !this.chats[this.currentChatId]) {
+        this.handleApiError(new Error("Aucune conversation sélectionnée"));
+        return;
       }
 
-      this.chats[this.currentChatId].messages.push(userMessage)
-      this.promptText = ''
-      this.saveAppState()
+      // 2. Sauvegarde le texte actuel et réinitialise le champ
+      const promptText = this.promptText;
+      this.promptText = '';
 
-      // Simuler une réponse de l'assistant (à remplacer par un vrai appel API)
-      setTimeout(() => {
-        const assistantMessage = {
-          role: 'assistant',
-          content: "Je suis une réponse simulée. Voici du code :\n\n```javascript\nconsole.log('Hello World!')\n```",
-          model: this.selectedModel,
-          timestamp: new Date().toISOString()
+      try {
+        // 3. Annule tout stream en cours
+        if (this.currentlyStreaming && this.streamController) {
+          this.streamController.abort();
+          this.currentlyStreaming = false;
         }
-        this.chats[this.currentChatId].messages.push(assistantMessage)
-        this.saveAppState()
-      }, 1000)
-    },
-    regenerateResponse(message) {
-      console.log('Regenerate response for:', message)
-    },
-    editUserMessage(message) {
-      console.log('Edit message:', message)
-    },
-    handleBeforeUnload(e) {
-      if (Object.keys(this.chats).length > 0) {
-        e.preventDefault()
-        this.showLeavePageModal = true
-        e.returnValue = ''
+
+        // 4. Crée un CancelToken pour Axios (ou AbortController pour fetch)
+        this.streamController = axios.CancelToken.source();
+
+        // 5. Ajoute le message de l'utilisateur à la conversation
+        const userMessage = {
+          role: 'user',
+          content: promptText,
+          timestamp: new Date().toISOString()
+        };
+        this.chats[this.currentChatId].messages.push(userMessage);
+        this.saveAppState();
+
+        // 6. Ajoute un indicateur de chargement
+        const waitingIndicator = {
+          role: 'assistant',
+          content: '',
+          timestamp: new Date().toISOString(),
+          isWaiting: true
+        };
+        this.chats[this.currentChatId].messages.push(waitingIndicator);
+        this.saveAppState();
+
+        // 7. Remplace l'indicateur par un message vide (pour le streaming)
+        const assistantMessageIndex = this.chats[this.currentChatId].messages.length - 1;
+        this.chats[this.currentChatId].messages[assistantMessageIndex] = {
+          role: 'assistant',
+          content: '',
+          model: this.selectedModel,
+          timestamp: new Date().toISOString(),
+          processing: true
+        };
+        this.saveAppState();
+
+        // 8. Prépare les messages pour l'API (filtre les indicateurs)
+        const messages = this.chats[this.currentChatId].messages
+          .filter(msg => !(msg.isWaiting || msg.processing))
+          .map(msg => ({
+            role: msg.role,
+            content: msg.content
+          }));
+
+        // 9. Construit le payload
+        const requestPayload = {
+          model: this.selectedModel,
+          messages: messages,
+          stream: this.settings.streaming
+        };
+
+        // Ajoute les paramètres optionnels
+        if (this.settings.temperature !== 1.0) requestPayload.temperature = this.settings.temperature;
+        if (this.settings.topP !== 1.0) requestPayload.top_p = this.settings.topP;
+        if (this.settings.topK !== 0) requestPayload.top_k = this.settings.topK;
+        if (this.settings.frequencyPenalty !== 0.0) requestPayload.frequency_penalty = this.settings.frequencyPenalty;
+        if (this.settings.presencePenalty !== 0.0) requestPayload.presence_penalty = this.settings.presencePenalty;
+        if (this.settings.repetitionPenalty !== 1.0) requestPayload.repetition_penalty = this.settings.repetitionPenalty;
+        if (this.settings.minP !== 0.0) requestPayload.min_p = this.settings.minP;
+        if (this.settings.topA !== 0.0) requestPayload.top_a = this.settings.topA;
+        if (this.settings.seed !== null) requestPayload.seed = this.settings.seed;
+        if (this.settings.maxTokens !== null) requestPayload.max_tokens = this.settings.maxTokens;
+        if (this.settings.logprobs) requestPayload.logprobs = true;
+        if (this.settings.topLogprobs !== null) requestPayload.top_logprobs = this.settings.topLogprobs;
+
+        // Paramètres de reasoning
+        if (this.settings.reasoning.effort || this.settings.reasoning.maxTokens || this.settings.reasoning.exclude) {
+          requestPayload.reasoning = {};
+          if (this.settings.reasoning.effort) requestPayload.reasoning.effort = this.settings.reasoning.effort;
+          if (this.settings.reasoning.maxTokens) requestPayload.reasoning.max_tokens = this.settings.reasoning.maxTokens;
+          if (this.settings.reasoning.exclude) requestPayload.reasoning.exclude = true;
+        }
+
+        console.log("Payload envoyé:", requestPayload); // Débogage
+
+        // 10. Envoie la requête
+        const startTime = Date.now();
+        this.currentlyStreaming = true;
+
+        if (this.settings.streaming) {
+          // Utilise fetch pour le streaming (meilleur support SSE)
+          const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${this.apiKey}`
+            },
+            body: JSON.stringify(requestPayload),
+            signal: this.streamController.token // Pour annuler la requête
+          });
+
+          if (!response.ok) {
+            throw new Error(`Erreur HTTP: ${response.status} ${response.statusText}`);
+          }
+
+          // Traite le flux SSE
+          await this.handleStreamResponse(response, startTime, assistantMessageIndex);
+        } else {
+          // Utilise Axios pour les réponses non-streaming
+          const response = await axios.post(
+            'https://openrouter.ai/api/v1/chat/completions',
+            requestPayload,
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${this.apiKey}`
+              },
+              cancelToken: this.streamController.token
+            }
+          );
+
+          // Traite la réponse complète
+          this.chats[this.currentChatId].messages[assistantMessageIndex] = {
+            role: 'assistant',
+            content: response.data.choices[0]?.message?.content || '',
+            model: response.data.model || this.selectedModel,
+            timestamp: new Date().toISOString(),
+            processingTime: (Date.now() - startTime) / 1000,
+            usage: response.data.usage || {}
+          };
+          this.saveAppState();
+        }
+      } catch (error) {
+        console.error("Erreur dans sendMessage:", error);
+        this.handleApiError(error);
+      } finally {
+        this.currentlyStreaming = false;
       }
     },
-    confirmLeavePage() {
-      window.close()
-    },
-    saveModelSettings(newSettings) {
-      this.settings = newSettings
-      this.saveAppState()
-    },
-    resetSettings() {
-      this.settings = {
-        temperature: 1.0,
-        topP: 1.0,
-        topK: 0,
-        frequencyPenalty: 0.0,
-        presencePenalty: 0.0,
-        repetitionPenalty: 1.0,
-        minP: 0.0,
-        topA: 0.0,
-        seed: null,
-        maxTokens: null,
-        logprobs: false,
-        topLogprobs: null,
-        streaming: true,
-        reasoning: { effort: null, maxTokens: null, exclude: false }
+
+  // Méthode pour gérer le streaming (à ajouter)
+  async handleStreamResponse(response, startTime, messageIndex) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buffer = '';
+    let content = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmedLine = line.trim();
+          if (!trimmedLine || trimmedLine.startsWith(':') || trimmedLine === 'data: [DONE]') {
+            continue;
+          }
+
+          if (trimmedLine.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(trimmedLine.slice(6));
+
+              // Ajoute le contenu du delta
+              if (data.choices?.[0]?.delta?.content) {
+                content += data.choices[0].delta.content;
+                this.chats[this.currentChatId].messages[messageIndex].content = content;
+                this.saveAppState();
+              }
+
+              // Met à jour les métadonnées si disponibles
+              if (data.usage) {
+                this.chats[this.currentChatId].messages[messageIndex].usage = data.usage;
+              }
+            } catch (e) {
+              console.error("Erreur de parsing SSE:", e, "Ligne:", trimmedLine);
+            }
+          }
+        }
+
+      // Finalise le message
+      this.chats[this.currentChatId].messages[messageIndex].processing = false;
+      this.chats[this.currentChatId].messages[messageIndex].processingTime = (Date.now() - startTime) / 1000;
+      this.saveAppState();
+    } } catch (error) {
+      if (error.name !== 'AbortError') {
+        throw error;
       }
-      this.saveAppState()
     }
+  },
+
+  // Méthode pour gérer les erreurs (à ajouter ou mettre à jour)
+  handleApiError(error) {
+    let errorMessage = 'Une erreur est survenue';
+
+    if (error.name === 'AbortError') {
+      errorMessage = 'Requête annulée';
+    } else if (error.response) {
+      // Erreur Axios
+      errorMessage = `Erreur ${error.response.status}: ${error.response.data?.error?.message || 'Erreur serveur'}`;
+    } else if (error.message) {
+      // Erreur native ou fetch
+      errorMessage = error.message;
+    }
+
+    // Affiche l'erreur dans l'interface
+    const errorMessageObj = {
+      role: 'error',
+      content: `⚠️ ${errorMessage}`,
+      timestamp: new Date().toISOString()
+    };
+
+    if (this.chats[this.currentChatId]) {
+      const lastMessageIndex = this.chats[this.currentChatId].messages.length - 1;
+      const lastMessage = this.chats[this.currentChatId].messages[lastMessageIndex];
+
+      if (lastMessage.isWaiting || lastMessage.processing) {
+        this.chats[this.currentChatId].messages[lastMessageIndex] = errorMessageObj;
+      } else {
+        this.chats[this.currentChatId].messages.push(errorMessageObj);
+      }
+      this.saveAppState();
+    }
+  },
+
+  // Méthode pour annuler le stream (déjà dans ton code)
+  cancelStream() {
+    if (this.currentlyStreaming && this.streamController) {
+      this.streamController.cancel('Requête annulée par l\'utilisateur');
+      this.currentlyStreaming = false;
+    }
+  }
+
+
+
+    
   }
 }
 </script>
@@ -423,4 +630,3 @@ export default {
   background: rgba(255, 255, 255, 0.2);
 }
 </style>
-
